@@ -1011,6 +1011,10 @@ func (r *Reader) initEncrypt(password string) error {
 	h.Write([]byte(O))
 	h.Write([]byte{byte(P), byte(P >> 8), byte(P >> 16), byte(P >> 24)})
 	h.Write([]byte(ID))
+	// PDF 32000-1 Algorithm 2, step (f).
+	if encryptMetadata, ok := encrypt["EncryptMetadata"].(bool); R >= 4 && ok && !encryptMetadata {
+		h.Write([]byte{0xff, 0xff, 0xff, 0xff})
+	}
 	key := h.Sum(nil)
 
 	keyLen := int(n / 8) // encryption key length in bytes
