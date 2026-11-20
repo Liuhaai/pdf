@@ -2,6 +2,7 @@ package pdf
 
 import (
 	"bytes"
+	"compress/zlib"
 	"crypto/aes"
 	"crypto/cipher"
 	"io"
@@ -24,11 +25,13 @@ func TestValueReaderOnNonStream(t *testing.T) {
 	}
 }
 
-func TestPNGUpReader(t *testing.T) {
+func TestPNGPredictorUp(t *testing.T) {
 	// Two rows of width 2 encoded with the PNG "Up" predictor (filter byte 2).
 	// Row 1: raw [5, 10]; Row 2: raw [1, 1] (differences from the previous row).
 	input := []byte{2, 5, 10, 2, 1, 1}
-	r := &pngUpReader{r: bytes.NewReader(input), hist: make([]byte, 3), tmp: make([]byte, 3)}
+	r := &pngPredictorReader{
+		r: bytes.NewReader(input), bytesPerPixel: 1, hist: make([]byte, 2), tmp: make([]byte, 3),
+	}
 
 	got, err := io.ReadAll(r)
 	if err != nil {
@@ -41,12 +44,45 @@ func TestPNGUpReader(t *testing.T) {
 	}
 }
 
-func TestPNGUpReaderRejectsBadFilter(t *testing.T) {
-	input := []byte{1, 5, 10} // filter byte 1 is not "Up"
-	r := &pngUpReader{r: bytes.NewReader(input), hist: make([]byte, 3), tmp: make([]byte, 3)}
+func TestPNGPredictorMixedRGBRows(t *testing.T) {
+	// Five rows with two RGB pixels each.
+	input := []byte{
+		0, 5, 10, 15, 20, 25, 30,
+		1, 6, 12, 18, 19, 23, 27,
+		2, 2, 2, 0, 5, 5, 10,
+		3, 5, 10, 11, 12, 16, 23,
+		4, 2, 2, 2, 2, 6, 5,
+	}
+	want := []byte{
+		5, 10, 15, 20, 25, 30,
+		6, 12, 18, 25, 35, 45,
+		8, 14, 18, 30, 40, 55,
+		9, 17, 20, 31, 44, 60,
+		11, 19, 22, 33, 50, 65,
+	}
+	var encoded bytes.Buffer
+	zw := zlib.NewWriter(&encoded)
+	if _, err := zw.Write(input); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	params := testValue(dict{"Predictor": int64(12), "Columns": int64(2), "Colors": int64(3)})
+	got, err := io.ReadAll(applyFilter(&encoded, "FlateDecode", params))
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("decoded = %v, %v, want %v", got, err, want)
+	}
+}
+
+func TestPNGPredictorRejectsBadFilter(t *testing.T) {
+	input := []byte{5, 5, 10} // PNG has no filter type 5.
+	r := &pngPredictorReader{
+		r: bytes.NewReader(input), bytesPerPixel: 1, hist: make([]byte, 2), tmp: make([]byte, 3),
+	}
 	_, err := io.ReadAll(r)
-	if err == nil || !strings.Contains(err.Error(), "malformed PNG-Up") {
-		t.Fatalf("err = %v, want malformed PNG-Up error", err)
+	if err == nil || !strings.Contains(err.Error(), "malformed PNG predictor") {
+		t.Fatalf("err = %v, want malformed PNG predictor error", err)
 	}
 }
 

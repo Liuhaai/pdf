@@ -69,6 +69,7 @@ import (
 	"encoding/ascii85"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -873,7 +874,6 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 		if pred.Kind() == Null {
 			return zr
 		}
-		columns := param.Key("Columns").Int64()
 		switch pred.Int64() {
 		default:
 			if DebugOn {
@@ -881,7 +881,29 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 			}
 			panic("pred")
 		case 12:
-			return &pngUpReader{r: zr, hist: make([]byte, 1+columns), tmp: make([]byte, 1+columns)}
+			columns := predictorParameter(param, "Columns", 1)
+			colors := predictorParameter(param, "Colors", 1)
+			bits := predictorParameter(param, "BitsPerComponent", 8)
+			switch bits {
+			case 1, 2, 4, 8, 16:
+			default:
+				panic("invalid PNG predictor BitsPerComponent")
+			}
+			if columns < 1 || colors < 1 || colors > (math.MaxInt64-7)/bits ||
+				columns > (math.MaxInt64-7)/(colors*bits) {
+				panic("invalid PNG predictor dimensions")
+			}
+			pixelBits := colors * bits
+			rowBytes := (columns*pixelBits + 7) / 8
+			if rowBytes >= int64(math.MaxInt) {
+				panic("invalid PNG predictor row size")
+			}
+			return &pngPredictorReader{
+				r:             zr,
+				bytesPerPixel: int((pixelBits + 7) / 8),
+				hist:          make([]byte, rowBytes),
+				tmp:           make([]byte, rowBytes+1),
+			}
 		}
 	case "ASCII85Decode":
 		cleanASCII85 := newAlphaReader(rd)
@@ -899,14 +921,23 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 	}
 }
 
-type pngUpReader struct {
-	r    io.Reader
-	hist []byte
-	tmp  []byte
-	pend []byte
+func predictorParameter(param Value, key string, fallback int64) int64 {
+	v := param.Key(key)
+	if v.Kind() == Null {
+		return fallback
+	}
+	return v.Int64()
 }
 
-func (r *pngUpReader) Read(b []byte) (int, error) {
+type pngPredictorReader struct {
+	r             io.Reader
+	bytesPerPixel int
+	hist          []byte
+	tmp           []byte
+	pend          []byte
+}
+
+func (r *pngPredictorReader) Read(b []byte) (int, error) {
 	n := 0
 	for len(b) > 0 {
 		if len(r.pend) > 0 {
@@ -920,15 +951,60 @@ func (r *pngUpReader) Read(b []byte) (int, error) {
 		if err != nil {
 			return n, err
 		}
-		if r.tmp[0] != 2 {
-			return n, fmt.Errorf("malformed PNG-Up encoding")
+		row, prev := r.tmp[1:], r.hist
+		stride := r.bytesPerPixel
+		switch r.tmp[0] {
+		case 0: // None
+		case 1: // Sub
+			for i := stride; i < len(row); i++ {
+				row[i] += row[i-stride]
+			}
+		case 2: // Up
+			for i := range row {
+				row[i] += prev[i]
+			}
+		case 3: // Average
+			for i := range row {
+				var left byte
+				if i >= stride {
+					left = row[i-stride]
+				}
+				row[i] += byte((int(left) + int(prev[i])) / 2)
+			}
+		case 4: // Paeth
+			for i := range row {
+				var left, upperLeft byte
+				if i >= stride {
+					left, upperLeft = row[i-stride], prev[i-stride]
+				}
+				row[i] += paeth(left, prev[i], upperLeft)
+			}
+		default:
+			return n, fmt.Errorf("malformed PNG predictor: filter type %d", r.tmp[0])
 		}
-		for i, b := range r.tmp {
-			r.hist[i] += b
-		}
-		r.pend = r.hist[1:]
+		copy(r.hist, row)
+		r.pend = r.hist
 	}
 	return n, nil
+}
+
+func paeth(left, up, upperLeft byte) byte {
+	p := int(left) + int(up) - int(upperLeft)
+	dl, du, dul := abs(p-int(left)), abs(p-int(up)), abs(p-int(upperLeft))
+	if dl <= du && dl <= dul {
+		return left
+	}
+	if du <= dul {
+		return up
+	}
+	return upperLeft
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
 }
 
 var passwordPad = []byte{
