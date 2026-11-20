@@ -32,12 +32,40 @@ func TestNewReaderRejectsInvalidHeader(t *testing.T) {
 }
 
 func TestNewReaderRejectsMissingEOF(t *testing.T) {
-	// Must be longer than the 100-byte EOF lookback chunk so the tail is
-	// actually read (NewReader reads the last 100 bytes).
-	data := []byte("%PDF-1.4\n" + strings.Repeat("x", 200))
+	data := []byte("%PDF-1.4\n")
 	_, err := NewReader(bytes.NewReader(data), int64(len(data)))
 	if err == nil || !strings.Contains(err.Error(), "EOF") {
 		t.Fatalf("err = %v, want missing %%EOF error", err)
+	}
+}
+
+func TestNewReaderAcceptsTrailerVariants(t *testing.T) {
+	original := string(buildContentPDF("BT ET"))
+	for _, tc := range []struct {
+		name string
+		data string
+	}{
+		{"spaces after startxref", strings.Replace(original, "startxref\n", "startxref \t\n", 1)},
+		{"junk after EOF", original + strings.Repeat("download error\n", 20)},
+		{"stray EOF marker", original + "download error\n%%EOF\n"},
+		{"embedded EOF", original + "download error\nhtml %%EOF\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := NewReader(strings.NewReader(tc.data), int64(len(tc.data)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := r.NumPage(); got != 1 {
+				t.Fatalf("NumPage() = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestNewReaderRejectsEOFSubstring(t *testing.T) {
+	data := strings.Replace(string(buildContentPDF("BT ET")), "%%EOF\n", "%%EOFX\n", 1)
+	if _, err := NewReader(strings.NewReader(data), int64(len(data))); err == nil {
+		t.Fatal("accepted a line that does not contain a complete EOF marker")
 	}
 }
 

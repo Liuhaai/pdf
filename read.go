@@ -141,36 +141,27 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 	if !bytes.HasPrefix(buf, []byte("%PDF-1.")) || buf[7] < '0' || buf[7] > '7' || buf[8] != '\r' && buf[8] != '\n' {
 		return nil, fmt.Errorf("not a PDF file: invalid header")
 	}
-	end := size
-	const endChunk = 100
-	buf = make([]byte, endChunk)
-	f.ReadAt(buf, end-endChunk)
-	for len(buf) > 0 && buf[len(buf)-1] == '\n' || buf[len(buf)-1] == '\r' {
-		buf = buf[:len(buf)-1]
-	}
-	buf = bytes.TrimRight(buf, "\r\n\t ")
-	if !bytes.HasSuffix(buf, []byte("%%EOF")) {
+	// Look back far enough for a trailer followed by a short download error or
+	// other appended bytes. Keep the read bounded even for very large PDFs.
+	tailSize := min(size, int64(1024))
+	if tailSize <= 0 {
 		return nil, fmt.Errorf("not a PDF file: missing %%%%EOF")
 	}
-	i := findLastLine(buf, "startxref")
-	if i < 0 {
-		return nil, fmt.Errorf("malformed PDF file: missing final startxref")
+	tailOffset := size - tailSize
+	buf = make([]byte, tailSize)
+	if _, err := f.ReadAt(buf, tailOffset); err != nil {
+		return nil, err
+	}
+	startxref, err := findStartXref(buf, tailOffset)
+	if err != nil {
+		return nil, err
 	}
 
 	r = &Reader{
 		f:   f,
-		end: end,
+		end: size,
 	}
-	pos := end - endChunk + int64(i)
-	b := newBuffer(io.NewSectionReader(f, pos, end-pos), pos)
-	if b.readToken() != keyword("startxref") {
-		return nil, fmt.Errorf("malformed PDF file: missing startxref")
-	}
-	startxref, ok := b.readToken().(int64)
-	if !ok {
-		return nil, fmt.Errorf("malformed PDF file: startxref not followed by integer")
-	}
-	b = newBuffer(io.NewSectionReader(r.f, startxref, r.end-startxref), startxref)
+	b := newBuffer(io.NewSectionReader(r.f, startxref, r.end-startxref), startxref)
 	xref, trailerptr, trailer, err := readXref(r, b)
 	if err != nil {
 		return nil, err
@@ -459,18 +450,61 @@ func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
 	return table, nil
 }
 
+func findStartXref(tail []byte, tailOffset int64) (int64, error) {
+	const eof = "%%EOF"
+	var trailerErr error
+	for limit := len(tail); limit > 0; {
+		i := bytes.LastIndex(tail[:limit], []byte(eof))
+		if i <= 0 {
+			break
+		}
+		limit = i
+		if tail[i-1] != '\r' && tail[i-1] != '\n' {
+			continue
+		}
+		after := bytes.TrimLeft(tail[i+len(eof):], " \t")
+		if len(after) > 0 && after[0] != '\r' && after[0] != '\n' {
+			continue
+		}
+
+		// The last marker may belong to appended text. Match the preceding
+		// startxref and require just an offset between the two marker lines.
+		j := findLastLine(tail[:i], "startxref")
+		if j < 0 {
+			if trailerErr == nil {
+				trailerErr = fmt.Errorf("malformed PDF file: missing final startxref")
+			}
+			continue
+		}
+		field := bytes.Trim(tail[j+len("startxref"):i], " \t\r\n\f\x00")
+		offset, err := strconv.ParseInt(string(field), 10, 64)
+		if err != nil {
+			trailerErr = fmt.Errorf("malformed PDF file: startxref not followed by integer")
+			continue
+		}
+		if offset <= 0 || offset >= tailOffset+int64(j) {
+			trailerErr = fmt.Errorf("malformed PDF file: startxref offset out of range")
+			continue
+		}
+		return offset, nil
+	}
+	if trailerErr != nil {
+		return 0, trailerErr
+	}
+	return 0, fmt.Errorf("not a PDF file: missing %%%%EOF")
+}
+
 func findLastLine(buf []byte, s string) int {
-	bs := []byte(s)
-	max := len(buf)
 	for {
-		i := bytes.LastIndex(buf[:max], bs)
-		if i <= 0 || i+len(bs) >= len(buf) {
+		i := bytes.LastIndex(buf, []byte(s))
+		if i <= 0 {
 			return -1
 		}
-		if (buf[i-1] == '\n' || buf[i-1] == '\r') && (buf[i+len(bs)] == '\n' || buf[i+len(bs)] == '\r') {
+		after := bytes.TrimLeft(buf[i+len(s):], " \t")
+		if len(after) > 0 && (buf[i-1] == '\n' || buf[i-1] == '\r') && (after[0] == '\n' || after[0] == '\r') {
 			return i
 		}
-		max = i
+		buf = buf[:i]
 	}
 }
 
