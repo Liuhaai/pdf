@@ -54,6 +54,7 @@ func TestNewReaderRejectsInvalidHeader(t *testing.T) {
 		"%PDF-",
 		"%PDF-1.4",
 		"%PDF-x.y\n",
+		"%PDF-1.x\n",
 		"%PDF-1-4\n",
 		"\n%PDF-1.4\n",
 	} {

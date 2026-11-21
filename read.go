@@ -136,8 +136,9 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 		}
 	}()
 
-	// Match the numeric version prefix. Some writers add spaces or a comment
-	// before the line break. Require a byte after the version.
+	// Check only "%PDF-" and a digit.digit version: writers put spaces, a comment
+	// or other bytes before the line break, and PDF 2.0 uses the same form. A file
+	// of 8 bytes or less can't be a PDF, so it fails here too.
 	buf := make([]byte, 9)
 	n, _ := f.ReadAt(buf, 0)
 	if n < len(buf) || !bytes.HasPrefix(buf, []byte("%PDF-")) ||
