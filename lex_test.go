@@ -19,10 +19,14 @@ func buildUnterminatedArrayPDF() []byte {
 // buildContentPDF constructs a minimal single-page PDF whose content stream
 // is content.
 func buildContentPDF(content string) []byte {
+	return buildContentPDFWithHeader("%PDF-1.4\n", content)
+}
+
+func buildContentPDFWithHeader(header, content string) []byte {
 	var buf bytes.Buffer
 	offsets := make([]int, 5)
 
-	buf.WriteString("%PDF-1.4\n")
+	buf.WriteString(header)
 
 	objs := []string{
 		"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",

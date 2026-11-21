@@ -23,11 +23,44 @@ func TestOpenMissingFile(t *testing.T) {
 	}
 }
 
+func TestNewReaderHeaderVariants(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		header string
+	}{
+		{"line feed", "%PDF-1.4\n"},
+		{"space before carriage return", "%PDF-1.2 \r"},
+		{"space before line feed", "%PDF-1.3 \n"},
+		{"space before comment", "%PDF-1.4 %comment\n"},
+		{"comment after version", "%PDF-1.7%comment\r\n"},
+		{"PDF 2.0", "%PDF-2.0\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data := buildContentPDFWithHeader(test.header, "BT ET")
+			reader, err := NewReader(bytes.NewReader(data), int64(len(data)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pages := reader.NumPage(); pages != 1 {
+				t.Fatalf("page count = %d, want 1", pages)
+			}
+		})
+	}
+}
+
 func TestNewReaderRejectsInvalidHeader(t *testing.T) {
-	data := []byte("this is not a pdf at all")
-	_, err := NewReader(bytes.NewReader(data), int64(len(data)))
-	if err == nil || !strings.Contains(err.Error(), "invalid header") {
-		t.Fatalf("err = %v, want 'invalid header' error", err)
+	for _, header := range []string{
+		"this is not a pdf at all",
+		"%PDF-",
+		"%PDF-1.4",
+		"%PDF-x.y\n",
+		"%PDF-1-4\n",
+		"\n%PDF-1.4\n",
+	} {
+		_, err := NewReader(strings.NewReader(header), int64(len(header)))
+		if err == nil || !strings.Contains(err.Error(), "invalid header") {
+			t.Errorf("header %q: err = %v, want 'invalid header' error", header, err)
+		}
 	}
 }
 

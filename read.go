@@ -136,9 +136,13 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 		}
 	}()
 
-	buf := make([]byte, 10)
-	f.ReadAt(buf, 0)
-	if !bytes.HasPrefix(buf, []byte("%PDF-1.")) || buf[7] < '0' || buf[7] > '7' || buf[8] != '\r' && buf[8] != '\n' {
+	// Match the numeric version prefix. Some writers add spaces or a comment
+	// before the line break. Require a byte after the version.
+	buf := make([]byte, 9)
+	n, _ := f.ReadAt(buf, 0)
+	if n < len(buf) || !bytes.HasPrefix(buf, []byte("%PDF-")) ||
+		buf[5] < '0' || buf[5] > '9' || buf[6] != '.' ||
+		buf[7] < '0' || buf[7] > '9' {
 		return nil, fmt.Errorf("not a PDF file: invalid header")
 	}
 	end := size
