@@ -260,17 +260,23 @@ func TestDecodeInt(t *testing.T) {
 	}
 }
 
-func TestFindLastLine(t *testing.T) {
-	buf := []byte("abc\nstartxref\n123\n%%EOF\n")
-	if got := findLastLine(buf, "startxref"); got != 4 {
-		t.Fatalf("findLastLine = %d, want 4", got)
-	}
-	if got := findLastLine(buf, "missing"); got != -1 {
-		t.Fatalf("findLastLine(missing) = %d, want -1", got)
-	}
-	// "startxref" at position 0 or with no trailing newline is rejected.
-	if got := findLastLine([]byte("startxref"), "startxref"); got != -1 {
-		t.Fatalf("findLastLine(bare) = %d, want -1", got)
+func TestFindStartXref(t *testing.T) {
+	for _, tc := range []struct {
+		tail       string
+		tailOffset int64
+		want       int64 // 0: an error
+	}{
+		{"abc\nstartxref\n123\n%%EOF\n", 1000, 123},
+		{"abc\rstartxref\r123\r%%EOF", 1000, 123},
+		{"abc\nstartxref\n123\n%%EOF\n", 0, 0},     // the offset must come before startxref
+		{"abc\n123\n%%EOF\n", 1000, 0},             // no startxref
+		{"startxref\n123\n%%EOF\n", 1000, 0},       // the first line may have started before the tail
+		{"abc\nstartxref\n12 3\n%%EOF\n", 1000, 0}, // not an offset
+	} {
+		got, err := findStartXref([]byte(tc.tail), tc.tailOffset)
+		if tc.want == 0 && err == nil || tc.want != 0 && (err != nil || got != tc.want) {
+			t.Errorf("findStartXref(%q, %d) = %d, %v; want %d", tc.tail, tc.tailOffset, got, err, tc.want)
+		}
 	}
 }
 

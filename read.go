@@ -149,7 +149,8 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 	}
 	tailOffset := size - tailSize
 	buf = make([]byte, tailSize)
-	if _, err := f.ReadAt(buf, tailOffset); err != nil {
+	// io.ReaderAt may return io.EOF with the last bytes, so check the count, not err.
+	if n, err := f.ReadAt(buf, tailOffset); n < len(buf) {
 		return nil, err
 	}
 	startxref, err := findStartXref(buf, tailOffset)
@@ -450,62 +451,43 @@ func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
 	return table, nil
 }
 
+// findStartXref returns the offset from the last "startxref", offset, "%%EOF" lines in
+// tail, the file's last bytes from tailOffset on. Bytes appended after those lines are
+// skipped, even ones with a %%EOF line of their own. Spaces, tabs and NULs around each
+// line are ignored, and so are blank lines.
 func findStartXref(tail []byte, tailOffset int64) (int64, error) {
-	const eof = "%%EOF"
-	var trailerErr error
-	for limit := len(tail); limit > 0; {
-		i := bytes.LastIndex(tail[:limit], []byte(eof))
-		if i <= 0 {
-			break
-		}
-		limit = i
-		if tail[i-1] != '\r' && tail[i-1] != '\n' {
-			continue
-		}
-		after := bytes.TrimLeft(tail[i+len(eof):], " \t")
-		if len(after) > 0 && after[0] != '\r' && after[0] != '\n' {
-			continue
-		}
-
-		// The last marker may belong to appended text. Match the preceding
-		// startxref and require just an offset between the two marker lines.
-		j := findLastLine(tail[:i], "startxref")
-		if j < 0 {
-			if trailerErr == nil {
-				trailerErr = fmt.Errorf("malformed PDF file: missing final startxref")
-			}
-			continue
-		}
-		field := bytes.Trim(tail[j+len("startxref"):i], " \t\r\n\f\x00")
-		offset, err := strconv.ParseInt(string(field), 10, 64)
-		if err != nil {
-			trailerErr = fmt.Errorf("malformed PDF file: startxref not followed by integer")
-			continue
-		}
-		if offset <= 0 || offset >= tailOffset+int64(j) {
-			trailerErr = fmt.Errorf("malformed PDF file: startxref offset out of range")
-			continue
-		}
-		return offset, nil
+	type line struct {
+		text []byte
+		at   int // offset in tail
 	}
-	if trailerErr != nil {
-		return 0, trailerErr
-	}
-	return 0, fmt.Errorf("not a PDF file: missing %%%%EOF")
-}
-
-func findLastLine(buf []byte, s string) int {
-	for {
-		i := bytes.LastIndex(buf, []byte(s))
-		if i <= 0 {
-			return -1
+	var lines []line
+	for at := 0; at < len(tail); {
+		end := bytes.IndexAny(tail[at:], "\r\n")
+		if end < 0 {
+			end = len(tail) - at
 		}
-		after := bytes.TrimLeft(buf[i+len(s):], " \t")
-		if len(after) > 0 && (buf[i-1] == '\n' || buf[i-1] == '\r') && (after[0] == '\n' || after[0] == '\r') {
-			return i
+		// The first line may have started before the tail: use it only at the start of the file.
+		if text := bytes.Trim(tail[at:at+end], " \t\f\x00"); len(text) > 0 && (at > 0 || tailOffset == 0) {
+			lines = append(lines, line{text, at})
 		}
-		buf = buf[:i]
+		at += end + 1
 	}
+	err := fmt.Errorf("not a PDF file: missing %%%%EOF")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if string(lines[i].text) != "%%EOF" {
+			continue
+		}
+		err = fmt.Errorf("malformed PDF file: missing final startxref")
+		if i < 2 || string(lines[i-2].text) != "startxref" {
+			continue
+		}
+		// The cross-reference section comes before the startxref keyword.
+		off, perr := strconv.ParseInt(string(lines[i-1].text), 10, 64)
+		if perr == nil && off > 0 && off < tailOffset+int64(lines[i-2].at) {
+			return off, nil
+		}
+	}
+	return 0, err
 }
 
 // A Value is a single PDF value, such as an integer, dictionary, or array.
