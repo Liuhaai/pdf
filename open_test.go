@@ -2,7 +2,9 @@ package pdf
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 )
@@ -54,6 +56,7 @@ func TestNewReaderRejectsInvalidHeader(t *testing.T) {
 		"%PDF-",
 		"%PDF-1.4",
 		"%PDF-x.y\n",
+		"%PDF-1.x\n",
 		"%PDF-1-4\n",
 		"\n%PDF-1.4\n",
 	} {
@@ -79,9 +82,14 @@ func TestNewReaderAcceptsTrailerVariants(t *testing.T) {
 		data string
 	}{
 		{"spaces after startxref", strings.Replace(original, "startxref\n", "startxref \t\n", 1)},
+		{"spaces before markers", strings.NewReplacer("startxref\n", " startxref\n", "%%EOF\n", "\t%%EOF\n").Replace(original)},
+		{"NULs after EOF", strings.Replace(original, "%%EOF\n", "%%EOF\x00\x00\x00", 1)},
 		{"junk after EOF", original + strings.Repeat("download error\n", 20)},
 		{"stray EOF marker", original + "download error\n%%EOF\n"},
 		{"embedded EOF", original + "download error\nhtml %%EOF\n"},
+		// An appended trailer whose offset can't be right is skipped for the real one.
+		{"appended trailer with offset 0", original + "startxref\n0\n%%EOF\n"},
+		{"appended trailer pointing past itself", original + "startxref\n999999\n%%EOF\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r, err := NewReader(strings.NewReader(tc.data), int64(len(tc.data)))
@@ -92,6 +100,50 @@ func TestNewReaderAcceptsTrailerVariants(t *testing.T) {
 				t.Fatalf("NumPage() = %d, want 1", got)
 			}
 		})
+	}
+}
+
+// eofAtEnd is a valid io.ReaderAt that returns io.EOF together with the bytes of a
+// read that reaches the end of the input.
+type eofAtEnd struct{ *bytes.Reader }
+
+func (r eofAtEnd) ReadAt(p []byte, off int64) (int, error) {
+	n, err := r.Reader.ReadAt(p, off)
+	if err == nil && off+int64(n) == r.Size() {
+		err = io.EOF
+	}
+	return n, err
+}
+
+func TestNewReaderAcceptsEOFWithLastBytes(t *testing.T) {
+	data := buildContentPDF("BT ET")
+	r, err := NewReader(eofAtEnd{bytes.NewReader(data)}, int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.NumPage(); got != 1 {
+		t.Fatalf("NumPage() = %d, want 1", got)
+	}
+}
+
+// failAtEnd fails every read that reaches the end of the input.
+type failAtEnd struct {
+	*bytes.Reader
+	err error
+}
+
+func (r failAtEnd) ReadAt(p []byte, off int64) (int, error) {
+	if off+int64(len(p)) >= r.Size() {
+		return 0, r.err
+	}
+	return r.Reader.ReadAt(p, off)
+}
+
+func TestNewReaderReturnsTailReadError(t *testing.T) {
+	data := buildContentPDF("BT ET")
+	want := errors.New("network failure")
+	if _, err := NewReader(failAtEnd{bytes.NewReader(data), want}, int64(len(data))); !errors.Is(err, want) {
+		t.Fatalf("err = %v, want %v", err, want)
 	}
 }
 

@@ -5,7 +5,12 @@ import (
 	"compress/zlib"
 	"crypto/aes"
 	"crypto/cipher"
+	"encoding/binary"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
+	"math/rand"
 	"strings"
 	"testing"
 )
@@ -83,6 +88,138 @@ func TestPNGPredictorRejectsBadFilter(t *testing.T) {
 	_, err := io.ReadAll(r)
 	if err == nil || !strings.Contains(err.Error(), "malformed PNG predictor") {
 		t.Fatalf("err = %v, want malformed PNG predictor error", err)
+	}
+}
+
+func zlibCompress(t *testing.T, b []byte) *bytes.Buffer {
+	t.Helper()
+	var out bytes.Buffer
+	zw := zlib.NewWriter(&out)
+	if _, err := zw.Write(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return &out
+}
+
+// pngIDAT returns the IDAT data of a PNG file, joined: one zlib stream.
+func pngIDAT(b []byte) []byte {
+	var idat []byte
+	for b = b[8:]; len(b) >= 12; {
+		n := binary.BigEndian.Uint32(b)
+		if string(b[4:8]) == "IDAT" {
+			idat = append(idat, b[8:8+n]...)
+		}
+		b = b[12+n:]
+	}
+	return idat
+}
+
+// TestPNGPredictorMatchesImagePNG decodes the IDAT data that image/png writes. It has the
+// layout PDF's PNG predictors use: each row is a filter type, then the filtered bytes. The
+// encoder picks a filter for each row, so all five types get used.
+func TestPNGPredictorMatchesImagePNG(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	used := map[byte]int{}
+	for i := 0; i < 300; i++ {
+		w, h := 1+rng.Intn(40), 1+rng.Intn(20)
+		// Gradients with some noise, so that the encoder picks every filter type.
+		sample := func(x, y, c int) uint8 {
+			if rng.Intn(4) == 0 {
+				return uint8(rng.Intn(256))
+			}
+			return uint8(x*7 + y*13 + c*50 + rng.Intn(3))
+		}
+		var img image.Image
+		var pix []byte
+		var colors, bits int64
+		switch i % 3 {
+		case 0:
+			m := image.NewGray(image.Rect(0, 0, w, h))
+			for y := 0; y < h; y++ {
+				for x := 0; x < w; x++ {
+					m.SetGray(x, y, color.Gray{sample(x, y, 0)})
+				}
+			}
+			img, pix, colors, bits = m, m.Pix, 1, 8
+		case 1:
+			m := image.NewNRGBA(image.Rect(0, 0, w, h))
+			for y := 0; y < h; y++ {
+				for x := 0; x < w; x++ {
+					// Alpha below 255 keeps the encoder from dropping the alpha channel.
+					m.SetNRGBA(x, y, color.NRGBA{sample(x, y, 0), sample(x, y, 1), sample(x, y, 2), 200 + uint8(rng.Intn(55))})
+				}
+			}
+			img, pix, colors, bits = m, m.Pix, 4, 8
+		case 2:
+			m := image.NewGray16(image.Rect(0, 0, w, h))
+			for y := 0; y < h; y++ {
+				for x := 0; x < w; x++ {
+					m.SetGray16(x, y, color.Gray16{uint16(sample(x, y, 0))<<8 | uint16(sample(x, y, 1))})
+				}
+			}
+			img, pix, colors, bits = m, m.Pix, 1, 16
+		}
+		var enc bytes.Buffer
+		if err := (&png.Encoder{CompressionLevel: png.BestCompression}).Encode(&enc, img); err != nil {
+			t.Fatal(err)
+		}
+		idat := pngIDAT(enc.Bytes())
+		zr, err := zlib.NewReader(bytes.NewReader(idat))
+		if err != nil {
+			t.Fatal(err)
+		}
+		filtered, err := io.ReadAll(zr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rowBytes := w * int(colors*bits/8)
+		for y := 0; y < h; y++ {
+			used[filtered[y*(rowBytes+1)]]++
+		}
+
+		params := testValue(dict{"Predictor": int64(12), "Columns": int64(w), "Colors": colors, "BitsPerComponent": bits})
+		got, err := io.ReadAll(applyFilter(bytes.NewReader(idat), "FlateDecode", params))
+		if err != nil || !bytes.Equal(got, pix) {
+			t.Fatalf("image %d (%dx%d, %d colors, %d bits): err %v, decoded bytes differ", i, w, h, colors, bits, err)
+		}
+	}
+	for f := byte(0); f <= 4; f++ {
+		if used[f] == 0 {
+			t.Errorf("no row used filter type %d", f)
+		}
+	}
+}
+
+// Values 10 to 15 all mean PNG prediction with a filter type on each row.
+func TestPNGPredictorValues(t *testing.T) {
+	input := []byte{0, 7, 2, 1, 1, 3} // without /Columns a row is one byte: None 7, Up +1, Sub 3
+	for pred := int64(10); pred <= 15; pred++ {
+		got, err := io.ReadAll(applyFilter(zlibCompress(t, input), "FlateDecode", testValue(dict{"Predictor": pred})))
+		if want := []byte{7, 8, 3}; err != nil || !bytes.Equal(got, want) {
+			t.Errorf("Predictor %d: %v, %v; want %v", pred, got, err, want)
+		}
+	}
+}
+
+func TestPNGPredictorRejectsBadParameters(t *testing.T) {
+	for _, p := range []dict{
+		{"Predictor": int64(12), "Columns": int64(50_000_000_000)}, // would allocate 100 GB
+		{"Predictor": int64(12), "Columns": int64(0)},
+		{"Predictor": int64(12), "Colors": int64(0)},
+		{"Predictor": int64(12), "Colors": int64(33)},
+		{"Predictor": int64(12), "BitsPerComponent": int64(3)},
+	} {
+		func() {
+			defer func() {
+				if r := recover(); r != "invalid PNG predictor parameters" {
+					t.Errorf("%v: recovered %v, want invalid PNG predictor parameters", p, r)
+				}
+			}()
+			applyFilter(zlibCompress(t, []byte{0, 0}), "FlateDecode", testValue(p))
+		}()
 	}
 }
 

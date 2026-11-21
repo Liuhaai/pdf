@@ -69,7 +69,6 @@ import (
 	"encoding/ascii85"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -137,8 +136,9 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 		}
 	}()
 
-	// Match the numeric version prefix. Some writers add spaces or a comment
-	// before the line break. Require a byte after the version.
+	// Check only "%PDF-" and a digit.digit version: writers put spaces, a comment
+	// or other bytes before the line break, and PDF 2.0 uses the same form. A file
+	// of 8 bytes or less can't be a PDF, so it fails here too.
 	buf := make([]byte, 9)
 	n, _ := f.ReadAt(buf, 0)
 	if n < len(buf) || !bytes.HasPrefix(buf, []byte("%PDF-")) ||
@@ -154,7 +154,8 @@ func NewReaderEncrypted(f io.ReaderAt, size int64, pw func() string) (r *Reader,
 	}
 	tailOffset := size - tailSize
 	buf = make([]byte, tailSize)
-	if _, err := f.ReadAt(buf, tailOffset); err != nil {
+	// io.ReaderAt may return io.EOF with the last bytes, so check the count, not err.
+	if n, err := f.ReadAt(buf, tailOffset); n < len(buf) {
 		return nil, err
 	}
 	startxref, err := findStartXref(buf, tailOffset)
@@ -455,62 +456,43 @@ func readXrefTableData(b *buffer, table []xref) ([]xref, error) {
 	return table, nil
 }
 
+// findStartXref returns the offset from the last "startxref", offset, "%%EOF" lines in
+// tail, the file's last bytes from tailOffset on. Bytes appended after those lines are
+// skipped, even ones with a %%EOF line of their own. Spaces, tabs and NULs around each
+// line are ignored, and so are blank lines.
 func findStartXref(tail []byte, tailOffset int64) (int64, error) {
-	const eof = "%%EOF"
-	var trailerErr error
-	for limit := len(tail); limit > 0; {
-		i := bytes.LastIndex(tail[:limit], []byte(eof))
-		if i <= 0 {
-			break
-		}
-		limit = i
-		if tail[i-1] != '\r' && tail[i-1] != '\n' {
-			continue
-		}
-		after := bytes.TrimLeft(tail[i+len(eof):], " \t")
-		if len(after) > 0 && after[0] != '\r' && after[0] != '\n' {
-			continue
-		}
-
-		// The last marker may belong to appended text. Match the preceding
-		// startxref and require just an offset between the two marker lines.
-		j := findLastLine(tail[:i], "startxref")
-		if j < 0 {
-			if trailerErr == nil {
-				trailerErr = fmt.Errorf("malformed PDF file: missing final startxref")
-			}
-			continue
-		}
-		field := bytes.Trim(tail[j+len("startxref"):i], " \t\r\n\f\x00")
-		offset, err := strconv.ParseInt(string(field), 10, 64)
-		if err != nil {
-			trailerErr = fmt.Errorf("malformed PDF file: startxref not followed by integer")
-			continue
-		}
-		if offset <= 0 || offset >= tailOffset+int64(j) {
-			trailerErr = fmt.Errorf("malformed PDF file: startxref offset out of range")
-			continue
-		}
-		return offset, nil
+	type line struct {
+		text []byte
+		at   int // offset in tail
 	}
-	if trailerErr != nil {
-		return 0, trailerErr
-	}
-	return 0, fmt.Errorf("not a PDF file: missing %%%%EOF")
-}
-
-func findLastLine(buf []byte, s string) int {
-	for {
-		i := bytes.LastIndex(buf, []byte(s))
-		if i <= 0 {
-			return -1
+	var lines []line
+	for at := 0; at < len(tail); {
+		end := bytes.IndexAny(tail[at:], "\r\n")
+		if end < 0 {
+			end = len(tail) - at
 		}
-		after := bytes.TrimLeft(buf[i+len(s):], " \t")
-		if len(after) > 0 && (buf[i-1] == '\n' || buf[i-1] == '\r') && (after[0] == '\n' || after[0] == '\r') {
-			return i
+		// The first line may have started before the tail: use it only at the start of the file.
+		if text := bytes.Trim(tail[at:at+end], " \t\f\x00"); len(text) > 0 && (at > 0 || tailOffset == 0) {
+			lines = append(lines, line{text, at})
 		}
-		buf = buf[:i]
+		at += end + 1
 	}
+	err := fmt.Errorf("not a PDF file: missing %%%%EOF")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if string(lines[i].text) != "%%EOF" {
+			continue
+		}
+		err = fmt.Errorf("malformed PDF file: missing final startxref")
+		if i < 2 || string(lines[i-2].text) != "startxref" {
+			continue
+		}
+		// The cross-reference section comes before the startxref keyword.
+		off, perr := strconv.ParseInt(string(lines[i-1].text), 10, 64)
+		if perr == nil && off > 0 && off < tailOffset+int64(lines[i-2].at) {
+			return off, nil
+		}
+	}
+	return 0, err
 }
 
 // A Value is a single PDF value, such as an integer, dictionary, or array.
@@ -918,27 +900,22 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 				fmt.Println("unknown predictor", pred)
 			}
 			panic("pred")
-		case 12:
+		case 10, 11, 12, 13, 14, 15: // PNG: every row starts with its own filter type
 			columns := predictorParameter(param, "Columns", 1)
 			colors := predictorParameter(param, "Colors", 1)
 			bits := predictorParameter(param, "BitsPerComponent", 8)
-			switch bits {
-			case 1, 2, 4, 8, 16:
-			default:
-				panic("invalid PNG predictor BitsPerComponent")
+			// Real limits, not only overflow checks: a failed allocation ends the
+			// process instead of panicking. 32 colors is DeviceN's limit in PDF 1.7,
+			// and no real image row is a million pixels wide.
+			if bits != 1 && bits != 2 && bits != 4 && bits != 8 && bits != 16 ||
+				colors < 1 || colors > 32 || columns < 1 || columns > 1<<20 {
+				panic("invalid PNG predictor parameters")
 			}
-			if columns < 1 || colors < 1 || colors > (math.MaxInt64-7)/bits ||
-				columns > (math.MaxInt64-7)/(colors*bits) {
-				panic("invalid PNG predictor dimensions")
-			}
-			pixelBits := colors * bits
-			rowBytes := (columns*pixelBits + 7) / 8
-			if rowBytes >= int64(math.MaxInt) {
-				panic("invalid PNG predictor row size")
-			}
+			pixelBits := int(colors * bits)
+			rowBytes := (int(columns)*pixelBits + 7) / 8 // at most 64 MiB
 			return &pngPredictorReader{
 				r:             zr,
-				bytesPerPixel: int((pixelBits + 7) / 8),
+				bytesPerPixel: (pixelBits + 7) / 8,
 				hist:          make([]byte, rowBytes),
 				tmp:           make([]byte, rowBytes+1),
 			}
