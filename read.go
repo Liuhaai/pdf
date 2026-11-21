@@ -69,7 +69,6 @@ import (
 	"encoding/ascii85"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -880,27 +879,22 @@ func applyFilter(rd io.Reader, name string, param Value) io.Reader {
 				fmt.Println("unknown predictor", pred)
 			}
 			panic("pred")
-		case 12:
+		case 10, 11, 12, 13, 14, 15: // PNG: every row starts with its own filter type
 			columns := predictorParameter(param, "Columns", 1)
 			colors := predictorParameter(param, "Colors", 1)
 			bits := predictorParameter(param, "BitsPerComponent", 8)
-			switch bits {
-			case 1, 2, 4, 8, 16:
-			default:
-				panic("invalid PNG predictor BitsPerComponent")
+			// Real limits, not only overflow checks: a failed allocation ends the
+			// process instead of panicking. 32 colors is DeviceN's limit in PDF 1.7,
+			// and no real image row is a million pixels wide.
+			if bits != 1 && bits != 2 && bits != 4 && bits != 8 && bits != 16 ||
+				colors < 1 || colors > 32 || columns < 1 || columns > 1<<20 {
+				panic("invalid PNG predictor parameters")
 			}
-			if columns < 1 || colors < 1 || colors > (math.MaxInt64-7)/bits ||
-				columns > (math.MaxInt64-7)/(colors*bits) {
-				panic("invalid PNG predictor dimensions")
-			}
-			pixelBits := colors * bits
-			rowBytes := (columns*pixelBits + 7) / 8
-			if rowBytes >= int64(math.MaxInt) {
-				panic("invalid PNG predictor row size")
-			}
+			pixelBits := int(colors * bits)
+			rowBytes := (int(columns)*pixelBits + 7) / 8 // at most 64 MiB
 			return &pngPredictorReader{
 				r:             zr,
-				bytesPerPixel: int((pixelBits + 7) / 8),
+				bytesPerPixel: (pixelBits + 7) / 8,
 				hist:          make([]byte, rowBytes),
 				tmp:           make([]byte, rowBytes+1),
 			}
